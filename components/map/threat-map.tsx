@@ -11,7 +11,8 @@ import Map, {
   type MapRef,
   type MapMouseEvent,
   type LayerProps,
-} from "react-map-gl/mapbox";
+} from "react-map-gl/maplibre";
+import type { GeoJSONSource } from "maplibre-gl";
 import { useMapStore } from "@/stores/map-store";
 import { useEventsStore } from "@/stores/events-store";
 import { useAuthStore } from "@/stores/auth-store";
@@ -22,7 +23,14 @@ import { SignInModal } from "@/components/auth/sign-in-modal";
 
 const APP_MODE = process.env.NEXT_PUBLIC_APP_MODE || "self-hosted";
 
-const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+const MAP_STYLE =
+  process.env.NEXT_PUBLIC_MAP_STYLE ||
+  "https://tiles.openfreemap.org/styles/dark";
+
+const EMPTY_FEATURE_COLLECTION: GeoJSON.FeatureCollection = {
+  type: "FeatureCollection",
+  features: [],
+};
 
 const clusterLayer: LayerProps = {
   id: "clusters",
@@ -651,6 +659,7 @@ export function ThreatMap() {
   const [blinkOpacity, setBlinkOpacity] = useState(0.4);
   const [showSignInModal, setShowSignInModal] = useState(false);
   const [nightPolygon, setNightPolygon] = useState<GeoJSON.Feature<GeoJSON.Polygon>>(() => calculateNightPolygon());
+  const [countriesData, setCountriesData] = useState<GeoJSON.FeatureCollection | null>(null);
 
   const requiresAuth = APP_MODE === "valyu";
 
@@ -756,6 +765,22 @@ export function ThreatMap() {
 
     fetchNuclearFacilities();
   }, [setNuclearFacilities, setNuclearFacilitiesLoading]);
+
+  // Load country boundaries for highlight overlays
+  useEffect(() => {
+    const fetchCountries = async () => {
+      try {
+        const response = await fetch("/data/countries.geojson");
+        if (!response.ok) return;
+        const data = (await response.json()) as GeoJSON.FeatureCollection;
+        setCountriesData(data);
+      } catch (error) {
+        console.error("Error loading country boundaries:", error);
+      }
+    };
+
+    fetchCountries();
+  }, []);
 
   // Recalculate day/night terminator every 5 minutes
   useEffect(() => {
@@ -1152,6 +1177,23 @@ export function ThreatMap() {
     [nightPolygon]
   );
 
+  const countryHighlightData = useMemo(() => {
+    if (!selectedCountryCode || !countriesData) {
+      return EMPTY_FEATURE_COLLECTION;
+    }
+
+    const code = selectedCountryCode.toUpperCase();
+    return {
+      type: "FeatureCollection" as const,
+      features: countriesData.features.filter((feature) => {
+        const props = feature.properties || {};
+        const isoA2 =
+          props.ISO_A2 && props.ISO_A2 !== "-99" ? props.ISO_A2 : props.ISO_A2_EH;
+        return typeof isoA2 === "string" && isoA2.toUpperCase() === code;
+      }),
+    };
+  }, [selectedCountryCode, countriesData]);
+
   const handleMapClick = useCallback(
     async (event: MapMouseEvent) => {
       // If clicking on a known feature (event, cluster, entity), handle that
@@ -1161,11 +1203,9 @@ export function ThreatMap() {
 
         if (layerId === "clusters" && mapRef.current) {
           const clusterId = feature.properties?.cluster_id;
-          const source = mapRef.current.getSource("events") as mapboxgl.GeoJSONSource;
+          const source = mapRef.current.getSource("events") as GeoJSONSource;
 
-          source.getClusterExpansionZoom(clusterId, (err, zoom) => {
-            if (err) return;
-
+          source.getClusterExpansionZoom(clusterId).then((zoom) => {
             mapRef.current?.easeTo({
               center: (feature.geometry as GeoJSON.Point).coordinates as [
                 number,
@@ -1174,6 +1214,8 @@ export function ThreatMap() {
               zoom: zoom || viewport.zoom + 2,
               duration: 500,
             });
+          }).catch(() => {
+            // Ignore cluster expansion errors
           });
           return;
         } else if (layerId === "unclustered-point") {
@@ -1312,15 +1354,13 @@ export function ThreatMap() {
 
       try {
         const response = await fetch(
-          `https://api.mapbox.com/geocoding/v5/mapbox.places/${lng},${lat}.json?types=country&access_token=${MAPBOX_TOKEN}`
+          `/api/geocode/reverse?lat=${encodeURIComponent(String(lat))}&lng=${encodeURIComponent(String(lng))}`
         );
         const data = await response.json();
 
-        if (data.features && data.features.length > 0) {
-          const countryFeature = data.features[0];
-          const countryName = countryFeature.place_name;
-          // Get ISO 3166-1 alpha-2 country code from short_code property
-          const countryCode = countryFeature.properties?.short_code?.toUpperCase() || null;
+        if (data.countryName) {
+          const countryName = data.countryName as string;
+          const countryCode = (data.countryCode as string | null) || null;
 
           // Always require sign-in for country clicks (answers about a place)
           if (requiresAuth && !isAuthenticated) {
@@ -1351,29 +1391,13 @@ export function ThreatMap() {
     }
   }, []);
 
-  if (!MAPBOX_TOKEN) {
-    return (
-      <div className="flex h-full w-full items-center justify-center bg-card">
-        <div className="text-center">
-          <p className="text-lg font-semibold text-foreground">
-            Mapbox Token Required
-          </p>
-          <p className="text-sm text-muted-foreground">
-            Please add NEXT_PUBLIC_MAPBOX_TOKEN to your .env.local file
-          </p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <Map
       ref={mapRef}
       {...viewport}
       onMove={(evt) => setViewport(evt.viewState)}
       onLoad={handleMapLoad}
-      mapStyle="mapbox://styles/mapbox/dark-v11"
-      mapboxAccessToken={MAPBOX_TOKEN}
+      mapStyle={MAP_STYLE}
       interactiveLayerIds={[
         ...(showClusters ? ["clusters"] : []),
         "unclustered-point",
@@ -1387,7 +1411,6 @@ export function ThreatMap() {
       onClick={handleMapClick}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
-      attributionControl={false}
     >
       <NavigationControl position="top-right" />
       <GeolocateControl position="top-right" />
@@ -1401,7 +1424,7 @@ export function ThreatMap() {
           paint={{
             "fill-color": "rgba(0,0,0,0.25)",
           }}
-          beforeId="waterway-label"
+          beforeId="place_other"
         />
       </Source>
 
@@ -1409,39 +1432,27 @@ export function ThreatMap() {
       {selectedCountryCode && (
         <Source
           id="country-boundaries"
-          type="vector"
-          url="mapbox://mapbox.country-boundaries-v1"
+          type="geojson"
+          data={countryHighlightData}
         >
           <Layer
             id="country-highlight"
             type="fill"
-            source-layer="country_boundaries"
-            filter={[
-              "all",
-              ["==", ["get", "iso_3166_1"], selectedCountryCode],
-              ["==", ["get", "worldview"], "all"],
-            ]}
             paint={{
               "fill-color": "#ef4444",
               "fill-opacity": blinkOpacity,
             }}
-            beforeId="waterway-label"
+            beforeId="place_other"
           />
           <Layer
             id="country-highlight-outline"
             type="line"
-            source-layer="country_boundaries"
-            filter={[
-              "all",
-              ["==", ["get", "iso_3166_1"], selectedCountryCode],
-              ["==", ["get", "worldview"], "all"],
-            ]}
             paint={{
               "line-color": "#ef4444",
               "line-width": 2,
               "line-opacity": 0.8,
             }}
-            beforeId="waterway-label"
+            beforeId="place_other"
           />
         </Source>
       )}
